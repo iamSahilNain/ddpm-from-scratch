@@ -52,3 +52,40 @@ schedule while everything else uses linear all pass its thirteen tests. The
 green suite was never the evidence I treated it as. `tests/test_derived.py`
 pins the closed form and the schedule source; all three mutants die there.
 
+2026-08-16 — checkpoints 3 and 4. `p_losses` is four lines and went in without
+incident. `p_sample_loop` needed `alpha_bars_prev` and `posterior_variance`,
+which went into `_Derived` rather than being rolled per step — the buffers are
+shared process-wide, and `ab_prev = alpha_bars.roll(1); ab_prev[0] = 1.0` is one
+missing `clone` away from corrupting `q_sample` for the rest of the run. Took
+the exact posterior variance over `beta_t`: it falls to zero at `t = 0`, so the
+no-noise-on-the-last-step carve-out comes out of the algebra instead of being
+bolted on. Kept the explicit branch anyway, so a draw that gets multiplied by
+zero cannot advance the RNG and make reproducibility depend on it.
+
+Two things that actually bit:
+
+The unfolded-posterior cross-check failed first time against `tiny_model`, at a
+max deviation of 1.04e-02 — but the untrained chain drifts into the hundreds
+over a thousand steps, so that is float32 rounding between two algebraically
+identical routes, not a bug. It also made the test useless for its real purpose:
+the carve-out it exists to catch adds noise of exactly the same 1e-02 magnitude.
+Switched it to the `GaussianOracle`, which holds the chain at unit scale; the
+two routes then agree to 1e-06 and the carve-out bug stands out by four orders
+of magnitude.
+
+Samples from an 800-step overfit run had the right structure but sat at mean
+-1.46 against training data at -0.01, which looked like a recursion bug. It is
+not — the oracle test says the recursion is exact. Training longer and measuring
+the model's mean eps-prediction bias settles it: bias -0.231 -> -0.0117 ->
+-0.0047 -> -0.0023 at 0/1000/2000/4000 steps, and sample mean tracks it
++38.6 -> +0.18 -> -0.062 -> -0.046, converging on the data's -0.008 with std
+0.392 against 0.415. A small constant bias in the noise prediction compounds
+over a thousand reverse steps. Worth remembering before blaming the sampler.
+
+Mutation testing on the new code, eight injected bugs, all caught — but three
+only by `test_derived.py`: the missing carve-out, the loop running forwards, and
+`model(x_t, t)` replaced by `model(x_t, zeros)`. That last one is the
+uncomfortable one, because `test_gradients_reach_the_timestep_embedding` is
+written to catch exactly it and does not: feeding constant zeros still sends
+gradient through the embedding.
+

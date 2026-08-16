@@ -279,7 +279,16 @@ def p_losses(model: torch.nn.Module, x0: Tensor, t: Tensor) -> Tensor:
     better for sample quality, which is a slightly uncomfortable but very
     reproducible result.
     """
-    raise NotImplementedError("checkpoint 3: implement the training objective")
+    # Drawn here rather than taken as an argument: the target has to be fresh
+    # every call, or the model is scored against a noise sample it has already
+    # seen for this image and the objective stops being an expectation.
+    noise = torch.randn_like(x0)
+    x_t = q_sample(x0, t, noise)
+    # `t` goes to the model as well as to q_sample. Without it the timestep MLP
+    # sits outside the graph, and the network quietly learns one average
+    # denoiser for every noise level.
+    predicted_noise = model(x_t, t)
+    return torch.nn.functional.mse_loss(predicted_noise, noise)
 
 
 @torch.no_grad()
@@ -353,7 +362,47 @@ def p_sample_loop(
     directly. Forgetting this leaves a visible layer of grain over every sample
     and is by far the most common bug in this function.
     """
-    raise NotImplementedError("checkpoint 4: implement ancestral sampling")
+    parameter_device = next(model.parameters()).device
+    if device is None:
+        device = parameter_device
+    device = torch.device(device)
+    if device != parameter_device:
+        raise ValueError(
+            f"cannot sample on {device} with a model whose parameters live on "
+            f"{parameter_device}; move the model first"
+        )
+
+    schedule = _derived(device=device, dtype=torch.float32)
+    timesteps = schedule.alpha_bars.shape[0]
+
+    # x_T. Legitimate only because the final alpha_bar is negligible, which is
+    # what make_beta_schedule had to earn. Pinned to `device` rather than left
+    # to `torch.set_default_device`.
+    x = torch.randn(tuple(shape), device=device)
+
+    for step in reversed(range(timesteps)):
+        t = torch.full((x.shape[0],), step, dtype=torch.long, device=device)
+        predicted_noise = model(x, t)
+
+        # Two steps, written as one. Inverting the forward marginal gives the
+        # implied clean image, x0 = (x_t - sqrt(1 - abar) * eps) / sqrt(abar);
+        # feeding that into the forward posterior's mean and cancelling the
+        # sqrt(abar) terms collapses to the line below. Derived in that order —
+        # folding it up front is how the sign errors get in.
+        mean = (
+            x
+            - schedule.betas[step] / schedule.sqrt_one_minus_alpha_bars[step] * predicted_noise
+        ) / schedule.alphas[step].sqrt()
+
+        if step > 0:
+            x = mean + schedule.posterior_variance[step].sqrt() * torch.randn_like(x)
+        else:
+            # The carve-out. posterior_variance[0] is already exactly zero, but
+            # branching keeps the RNG stream from advancing on a draw that gets
+            # multiplied away, which would make reproducibility depend on it.
+            x = mean
+
+    return x
 
 
 # --------------------------------------------------------------------------- #
@@ -389,6 +438,14 @@ class _Derived(NamedTuple):
     alpha_bars: Tensor
     sqrt_alpha_bars: Tensor
     sqrt_one_minus_alpha_bars: Tensor
+    #: ``alpha_bars`` shifted one step later, with one prepended for ``t = 0``,
+    #: where "the previous timestep" is the clean image and no signal has been
+    #: removed yet. Only the reverse process needs it.
+    alpha_bars_prev: Tensor
+    #: The exact variance of the forward posterior over ``x_{t-1}`` given both
+    #: ``x_t`` and ``x_0`` — Ho et al.'s lower bound on the reverse-step
+    #: variance. Zero at ``t = 0`` by construction.
+    posterior_variance: Tensor
 
 
 _DERIVED_CACHE: dict[tuple, _Derived] = {}
@@ -430,12 +487,17 @@ def _derived(
         betas = default_betas(kind, timesteps).to(torch.float64)
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
+        alpha_bars_prev = torch.cat(
+            [torch.ones(1, dtype=torch.float64, device="cpu"), alpha_bars[:-1]]
+        )
         buffers = _Derived(
             betas=betas,
             alphas=alphas,
             alpha_bars=alpha_bars,
             sqrt_alpha_bars=alpha_bars.sqrt(),
             sqrt_one_minus_alpha_bars=(1.0 - alpha_bars).sqrt(),
+            alpha_bars_prev=alpha_bars_prev,
+            posterior_variance=betas * (1.0 - alpha_bars_prev) / (1.0 - alpha_bars),
         )
         # `.to` is a no-op returning the same object when the dtype and device
         # already match, which would alias these buffers to `_BETA_CACHE` and

@@ -4,10 +4,10 @@ A denoising diffusion probabilistic model (Ho et al., 2020) on MNIST, in plain
 PyTorch. No `diffusers`, no HuggingFace generative libraries — the point is that
 the diffusion process is written out by hand.
 
-The repo is scaffolding around a hole. The UNet, dataloader, training loop,
-plotting helpers and test suite are complete; the four functions that *are* the
-diffusion model started as stubs with contracts and no bodies. The forward
-process is now filled in — the training objective and the sampler are not.
+The repo was scaffolding around a hole: the UNet, dataloader, training loop,
+plotting helpers and test suite were complete, and the four functions that
+*are* the diffusion model were stubs with contracts and no bodies. All four are
+now written. The whole suite is green and the reverse process generates images.
 
 ## Status
 
@@ -17,9 +17,9 @@ process is now filled in — the training objective and the sampler are not.
 | `data.py` — MNIST, normalised to the range −1…1 | done |
 | `train.py` — AMP, EMA, checkpoint/resume, CSV logging | done |
 | `viz.py` / `sample.py` — grids, forward-process strip, loss curve | done |
-| `tests/` — 95 tests | done |
+| `tests/` — 100 tests | done |
 | `diffusion.py` — schedule, forward marginal | done |
-| `diffusion.py` — training objective, sampler | **stubs** |
+| `diffusion.py` — training objective, sampler | done |
 
 ## Setup
 
@@ -30,24 +30,31 @@ pip install -r requirements.txt
 `torchvision` is only needed for the MNIST loaders. Everything else — the model,
 the diffusion code, the whole test suite — runs without it.
 
-## The checkpoint
+## The four functions
 
 Four functions in [`diffusion.py`](diffusion.py), each with a docstring stating
-its exact contract (shapes, dtypes, indexing, and what the maths has to mean).
-The two still carrying a `raise NotImplementedError` are marked:
+its exact contract (shapes, dtypes, indexing, and what the maths has to mean):
 
 1. `make_beta_schedule(kind, timesteps)` — the variance schedule everything else
-   is derived from. Done: linear (Ho et al.) and cosine (Nichol & Dhariwal).
+   is derived from. Linear (Ho et al.) and cosine (Nichol & Dhariwal).
 2. `q_sample(x0, t, noise)` — the closed-form forward marginal: jump from a
-   clean image to any timestep in one shot. Done.
+   clean image to any timestep in one shot.
 3. `p_losses(model, x0, t)` — the simplified noise-prediction training
-   objective. **Stub.**
-4. `p_sample_loop(model, shape)` — ancestral sampling, noise to image. **Stub.**
+   objective. Four lines on top of `q_sample`.
+4. `p_sample_loop(model, shape)` — ancestral sampling, noise to image.
 
-The derived quantities the schedule feeds — `alphas`, `alpha_bars` and the two
-square-root terms — are cached per `(kind, timesteps, device, dtype)` by the
-private `_derived` helper, which is what `q_sample` reads and what the
-remaining two functions should read too. The derivation runs in float64 on the
+The reverse step uses the **exact forward posterior variance**,
+`β̃ₜ = βₜ(1−ᾱₜ₋₁)/(1−ᾱₜ)` — Ho et al.'s lower bound, not the `βₜ` upper bound.
+They report the two performing about equally; this one is picked because it
+falls to exactly zero at `t = 0`, so the "add no noise on the last step"
+carve-out is what the algebra says rather than a special case bolted on. The
+loop still branches on `t > 0` explicitly, to keep a pointless draw from
+advancing the RNG stream and making reproducibility depend on it.
+
+The derived quantities the schedule feeds — `alphas`, `alpha_bars`, the two
+square-root terms, `alpha_bars_prev` and `posterior_variance` — are cached per
+`(kind, timesteps, device, dtype)` by the private `_derived` helper, which is
+what all four functions read. The derivation runs in float64 on the
 CPU and is cast only at the end, so the square roots are taken before any
 precision is lost. That matters for the cosine schedule, whose final
 `alpha_bar` of 2.4e-09 flushes to exactly zero in float16 while its square root
@@ -57,9 +64,10 @@ danger. The buffers are shared process-wide and must be treated as read-only.
 Timesteps are zero-indexed throughout: `t = 0` is the first, gentlest noising
 step and `t = T - 1` is the last. The tests assume this.
 
-Suggested order: 1 → 2 → verify visually with the forward-process grid → 3 →
-train something → 4. Sampling is the one that is hardest to debug from the loss
-alone, so leave it until the first three are solid.
+They were built in the order 1 → 2 → verify visually with the forward-process
+grid → 3 → train something → 4, which is the order to redo them in if you strip
+the bodies out to work through it yourself. Sampling is the one that is hardest
+to debug from the loss alone, so it goes last.
 
 ## Running the tests
 
@@ -67,17 +75,13 @@ alone, so leave it until the first three are solid.
 pytest
 ```
 
-`test_model.py`, `test_schedule.py`, `test_q_sample.py` and `test_derived.py`
-pass today — 67 passed, 11 failed, 2 skipped on `pytest -m "not slow"`, out of
-95 collected. The failures are all of `test_losses.py`. Include the slow marker
-and `test_sampling.py` and `test_overfit.py` join them, taking it to 22 failed
-and 4 errors — the errors are `test_overfit.py`'s module-scoped fixture raising
-during setup rather than the tests themselves failing. All 26 are a
-`NotImplementedError` from checkpoint 3 or 4. The two skips are the optional
-`quadratic` and `sigmoid` schedules, which correctly raise `ValueError`.
+Everything passes: **98 passed, 2 skipped** out of 100 collected. The two skips
+are the optional `quadratic` and `sigmoid` schedules, which correctly raise
+`ValueError`.
 
-Skip the two slow files (full thousand-step sampling chains and an optimisation
-loop, about a minute together):
+Skip the slow tests (full thousand-step sampling chains and an optimisation
+loop — two whole files plus one test in `test_derived.py`, about two minutes
+together):
 
 ```bash
 pytest -m "not slow"
@@ -97,17 +101,28 @@ What the suite checks, beyond shapes and finiteness:
   `sqrt(alpha_bar)`, a `+1` index shift, and `q_sample` running on the cosine
   schedule while everything else runs on linear all pass all thirteen tests.
   The behavioural suite specifies the process; it does not pin the function.
-- **`test_derived.py`** — which is what pins it, now that the function exists.
-  Recomputes the closed form in float64, asserts `q_sample` reads the same
-  schedule `make_beta_schedule` produces, and covers the cache and the input
-  contracts. All three mutants above die here. Kept in a separate file so
-  `test_q_sample.py` stays a specification rather than a regression net.
+- **`test_derived.py`** — which is what pins it, now that the functions exist.
+  Recomputes the closed forms in float64, asserts `q_sample` and `p_losses`
+  read the same schedule `make_beta_schedule` produces, cross-checks the folded
+  reverse step against Ho et al. eq. 7 written out the long way, and covers the
+  cache and the input contracts. All three mutants above die here. Kept in a
+  separate file so the behavioural suites stay specifications rather than
+  regression nets.
 - **`test_losses.py`** — a finite scalar, reduced as a mean rather than a sum,
   with gradients reaching every parameter including the timestep embedding.
+  Worth knowing its limit: `test_gradients_reach_the_timestep_embedding` does
+  not catch conditioning being dropped. Replace `model(x_t, t)` with
+  `model(x_t, zeros)` and the embedding still receives gradient, so the whole
+  file stays green — only `test_derived.py` notices.
+- **`test_derived.py`** (again, for the reverse process) — three mutants are
+  caught by *nothing else in the suite*: the missing no-noise carve-out at the
+  last step, the loop running forwards instead of backwards, and the dropped
+  timestep conditioning above.
 - **`test_sampling.py`** — structural checks, plus one test with real teeth:
   sampling with a denoiser whose optimum is known in closed form has to return
   standard Gaussian samples. Sign errors, swapped alpha terms and a mis-scaled
-  posterior variance all pass the structural checks and fail that one.
+  posterior variance all pass the structural checks and fail that one. It
+  currently returns mean −0.017, std 0.998 against tolerances of 0.10 and 0.15.
 - **`test_overfit.py`** — the loss on a fixed batch of eight comes down from
   about 1.0 to under 0.25. Composition, not correctness of any single function.
 
@@ -154,7 +169,7 @@ per-step trace is dominated by which timesteps happened to be drawn.
 ## Layout
 
 ```
-diffusion.py   forward process (done), objective and sampler (stubs)
+diffusion.py   schedule, forward marginal, objective, ancestral sampler
 model.py       UNet, sinusoidal timestep embedding, FiLM-conditioned res blocks
 data.py        MNIST at [-1, 1], plus a synthetic batch for tests
 train.py       training loop, EMA, AMP, checkpointing, CSV logging

@@ -1,4 +1,4 @@
-"""The schedule cache behind ``q_sample``, and the input contracts it enforces.
+"""The schedule cache behind the diffusion process, and the contracts it enforces.
 
 Deliberately a different kind of test from ``test_q_sample.py``. That file is
 behavioural on purpose — it never restates the closed form, so that passing it
@@ -20,11 +20,14 @@ import pytest
 import torch
 
 from conftest import structured_batch
+from test_sampling import GaussianOracle
 from diffusion import (
     DEFAULT_TIMESTEPS,
     _derived,
     default_betas,
     make_beta_schedule,
+    p_losses,
+    p_sample_loop,
     q_sample,
 )
 
@@ -168,3 +171,121 @@ def test_non_integral_schedule_lengths_are_rejected(bad):
     """`int()` would truncate 10.9 to a ten-step schedule with no signal."""
     with pytest.raises(ValueError):
         make_beta_schedule("linear", bad)
+
+
+# --------------------------------------------------------------------------- #
+# The posterior buffers the reverse process reads
+# --------------------------------------------------------------------------- #
+
+
+def test_posterior_buffers_match_their_closed_forms():
+    schedule = _derived(dtype=torch.float64)
+    alpha_bars = schedule.alpha_bars
+
+    expected_prev = torch.cat([torch.ones(1, dtype=torch.float64), alpha_bars[:-1]])
+    assert torch.allclose(schedule.alpha_bars_prev, expected_prev)
+
+    expected_variance = schedule.betas * (1.0 - expected_prev) / (1.0 - alpha_bars)
+    assert torch.allclose(schedule.posterior_variance, expected_variance)
+
+
+def test_the_posterior_variance_vanishes_at_the_first_step():
+    """``alpha_bars_prev[0]`` is one, so the algebra already says "add no noise".
+
+    The loop still branches on it rather than relying on this, but if the buffer
+    were built with a roll instead of a prepended one, this would come out as
+    ``alpha_bars[-1]`` and the last step would get a full beta of grain.
+    """
+    assert _derived(dtype=torch.float64).posterior_variance[0].item() == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# The objective and the reverse recursion, pinned
+# --------------------------------------------------------------------------- #
+
+
+def test_p_losses_scores_the_noise_not_the_image(tiny_model, x0):
+    """Recompute the objective with the same seeded noise draw.
+
+    The behavioural file cannot see this: a loss scored against ``x0``, or one
+    reduced with ``sum``, or a model called without ``t``, all still produce a
+    finite order-one scalar with gradients flowing.
+    """
+    t = torch.full((x0.shape[0],), 300, dtype=torch.long)
+
+    torch.manual_seed(5)
+    actual = p_losses(tiny_model, x0, t)
+
+    torch.manual_seed(5)
+    noise = torch.randn_like(x0)
+    expected = torch.nn.functional.mse_loss(tiny_model(q_sample(x0, t, noise), t), noise)
+
+    assert torch.allclose(actual, expected), f"{actual.item()} != {expected.item()}"
+
+
+@pytest.mark.slow
+def test_the_reverse_step_matches_the_unfolded_posterior():
+    """Cross-check the folded recursion against Ho et al. eq. 7 written out.
+
+    ``p_sample_loop`` collapses "invert the forward marginal, then take the
+    posterior mean" into one expression. This runs the same chain the long way —
+    implied ``x_0`` first, then the posterior mean as an explicit combination of
+    ``x_0`` and ``x_t`` — so a folding error shows up as a mismatch rather than
+    being duplicated into the reference.
+
+    It also pins the no-noise carve-out at the last step, which is otherwise
+    nearly invisible: beta_0 is 1e-4, so wrongly adding that noise moves the
+    output std by 5e-05 and no statistical test in the suite would notice.
+
+    Both chains consume the global RNG in the same order, which is what makes
+    them comparable at all. That is a deliberate coupling — if the draw order in
+    ``p_sample_loop`` ever changes, this test is supposed to break and be
+    re-read, not silently updated.
+
+    Run against the oracle rather than an untrained UNet on purpose. An
+    untrained network drifts into the hundreds over a thousand steps, and the
+    float32 rounding difference between the two algebraic routes drifts with it
+    — to about 1e-02, which would swallow the 1e-02 of spurious grain. The
+    oracle keeps the chain at unit scale, where the two routes agree to 1e-06
+    and the carve-out bug stands out by four orders of magnitude.
+    """
+    model = GaussianOracle().eval()
+    shape = (2, 1, 8, 8)
+    schedule = _derived(dtype=torch.float32)
+
+    torch.manual_seed(31)
+    actual = p_sample_loop(model, shape, device=torch.device("cpu"))
+
+    torch.manual_seed(31)
+    x = torch.randn(shape)
+    for step in reversed(range(DEFAULT_TIMESTEPS)):
+        t = torch.full((shape[0],), step, dtype=torch.long)
+        with torch.no_grad():
+            predicted_noise = model(x, t)
+
+        alpha_bar = schedule.alpha_bars[step]
+        alpha_bar_prev = schedule.alpha_bars_prev[step]
+        beta = schedule.betas[step]
+
+        implied_x0 = (x - (1.0 - alpha_bar).sqrt() * predicted_noise) / alpha_bar.sqrt()
+        mean = (
+            alpha_bar_prev.sqrt() * beta / (1.0 - alpha_bar) * implied_x0
+            + schedule.alphas[step].sqrt() * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar) * x
+        )
+
+        if step > 0:
+            x = mean + schedule.posterior_variance[step].sqrt() * torch.randn_like(x)
+        else:
+            x = mean
+
+    assert torch.allclose(actual, x, atol=1e-4), (
+        f"max deviation {(actual - x).abs().max().item():.3e} between the folded "
+        "recursion and the unfolded posterior — the carve-out bug shows up here "
+        "at around 1e-02"
+    )
+
+
+def test_sampling_refuses_a_device_the_model_is_not_on(tiny_model):
+    """Otherwise this surfaces as a RuntimeError from inside the first forward."""
+    with pytest.raises(ValueError):
+        p_sample_loop(tiny_model, (1, 1, 8, 8), device=torch.device("meta"))
