@@ -100,11 +100,22 @@ class GaussianOracle(nn.Module):
     it back to itself. So the test below has a ground truth that was computed
     without reference to how the recursion is written.
 
-    That makes it the sharpest check in the suite. Every structural test above
-    passes for a chain with a sign error, a swapped pair of alpha terms, a
-    posterior variance off by a factor, or an off-by-one in the loop bounds; all
-    of those move the output distribution away from standard Gaussian, most of
-    them by orders of magnitude.
+    A correction, measured rather than assumed. This test is nothing like as
+    sharp as it was originally billed. It catches a sign error and a posterior
+    variance off by a large factor. It does **not** catch a swapped pair of
+    alpha terms or an off-by-one in the loop bounds: seven such mutants were
+    measured at std 0.9835 to 1.0052, every one of them inside the tolerance
+    below.
+
+    The reason is the choice of data. Ho et al. observe that the ``beta_t``
+    variance is optimal for standard Gaussian data, and this implementation
+    uses the other choice, the exact posterior ``beta-tilde``. So the check is
+    graded on the distribution where the two branches agree most closely and
+    the residual is least diagnostic.
+
+    ``tests/test_derived.py`` carries the checks with real teeth: an unfolded
+    recomputation of the recursion, and a point-mass oracle whose contraction
+    the wrong coefficients miss by orders of magnitude rather than percent.
     """
 
     def __init__(self, timesteps: int = DEFAULT_TIMESTEPS):

@@ -17,7 +17,7 @@ now written. The whole suite is green and the reverse process generates images.
 | `data.py` — MNIST, normalised to the range −1…1 | done |
 | `train.py` — AMP, EMA, checkpoint/resume, CSV logging | done |
 | `viz.py` / `sample.py` — grids, forward-process strip, loss curve | done |
-| `tests/` — 100 tests | done |
+| `tests/` — 104 tests | done |
 | `diffusion.py` — schedule, forward marginal | done |
 | `diffusion.py` — training objective, sampler | done |
 
@@ -75,7 +75,7 @@ to debug from the loss alone, so it goes last.
 pytest
 ```
 
-Everything passes: **98 passed, 2 skipped** out of 100 collected. The two skips
+Everything passes: **102 passed, 2 skipped** out of 104 collected. The two skips
 are the optional `quadratic` and `sigmoid` schedules, which correctly raise
 `ValueError`.
 
@@ -114,15 +114,25 @@ What the suite checks, beyond shapes and finiteness:
   not catch conditioning being dropped. Replace `model(x_t, t)` with
   `model(x_t, zeros)` and the embedding still receives gradient, so the whole
   file stays green — only `test_derived.py` notices.
-- **`test_derived.py`** (again, for the reverse process) — three mutants are
-  caught by *nothing else in the suite*: the missing no-noise carve-out at the
-  last step, the loop running forwards instead of backwards, and the dropped
-  timestep conditioning above.
-- **`test_sampling.py`** — structural checks, plus one test with real teeth:
-  sampling with a denoiser whose optimum is known in closed form has to return
-  standard Gaussian samples. Sign errors, swapped alpha terms and a mis-scaled
-  posterior variance all pass the structural checks and fail that one. It
-  currently returns mean −0.017, std 0.998 against tolerances of 0.10 and 0.15.
+- **`test_derived.py`** (again, for the reverse process) — this is where the
+  recursion is actually guarded. Two independent checks: the unfolded
+  recomputation, and a **point-mass oracle** whose optimal denoiser is analytic
+  and whose reverse chain must contract unit variance down to nothing and land
+  on the point. That second one exists because the Gaussian oracle above is
+  blind to whole classes of coefficient error, whereas a point mass misses them
+  by orders of magnitude. Mutants caught by nothing else in the suite: the
+  missing carve-out, the loop running forwards, the loop skipping its final
+  step, dropped timestep conditioning, timesteps permuted across the batch, and
+  three ways of clamping the schedule so part of it is never trained.
+- **`test_sampling.py`** — structural checks, plus a closed-form oracle on
+  standard Gaussian data, currently returning mean −0.017 and std 0.998
+  against tolerances of 0.10 and 0.15. It is weaker than it looks and than an
+  earlier version of this README claimed: it catches a sign error and a badly
+  mis-scaled variance, but measurement says it catches **none** of seven
+  swapped-alpha and off-by-one mutants, all of which land between std 0.9835
+  and 1.0052. N(0, I) is the wrong probe, because Ho et al. note `βₜ` is
+  optimal for exactly that data while this code uses `β̃ₜ`, so the two branches
+  agree most closely precisely where the test measures.
 - **`test_overfit.py`** — the loss on a fixed batch of eight comes down from
   about 1.0 to under 0.25. Composition, not correctness of any single function.
 

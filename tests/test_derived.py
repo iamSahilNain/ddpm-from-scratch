@@ -83,19 +83,78 @@ def test_the_variance_preserving_identity_holds():
 
 
 def test_buffers_are_not_aliased_to_the_beta_cache():
-    """`.to()` is a no-op when the dtype and device already match.
+    """An in-place edit of a derived buffer must not reach ``_BETA_CACHE``.
 
-    Left uncloned, the cached ``betas`` would be the very object
-    ``default_betas`` hands out, and one in-place edit anywhere would poison
-    both caches for the rest of the process.
+    Honest note on what this does and does not pin. It cannot fail while the
+    derivation casts to float64, because that cast copies unconditionally — so
+    deleting the `.clone()` in `_derived` leaves this green. It is kept as a
+    guard on the *property*, which would stop holding if anyone made the
+    derivation float32 again, not as evidence that the clone earns its place.
+
+    What genuinely is not protected is documented in
+    :func:`test_derived_buffers_are_shared_and_mutable` below.
+
+    Restoration here must be `copy_`, never `add_(1.0)` then `sub_(1.0)`. That
+    round-trip does not restore a float32 tensor — 1e-04 comes back as
+    1.0001659e-04, perturbing 993 of 1000 betas — and because the buffer is
+    shared process-wide, it silently poisons the schedule for every test that
+    runs afterwards, including the reverse-step pin that is the only guard on
+    the recursion's coefficients.
     """
     schedule = _derived("linear", DEFAULT_TIMESTEPS, dtype=torch.float32)
     assert schedule.betas is not default_betas("linear", DEFAULT_TIMESTEPS)
 
     before = default_betas().clone()
-    schedule.betas.add_(1.0)  # deliberate abuse; must not reach the other cache
-    assert torch.equal(default_betas(), before)
-    schedule.betas.sub_(1.0)
+    original = schedule.betas.clone()
+    try:
+        schedule.betas.add_(1.0)  # deliberate abuse; must not reach the other cache
+        assert torch.equal(default_betas(), before)
+    finally:
+        schedule.betas.copy_(original)
+    assert torch.equal(schedule.betas, original)
+
+
+def test_derived_buffers_are_shared_and_mutable():
+    """Characterisation, not endorsement: the cache hands out live references.
+
+    Every caller receives the same tensors, so one in-place write corrupts the
+    schedule for the whole process and can leave a ``_Derived`` internally
+    inconsistent — ``alphas`` no longer equal to ``1 - betas`` — with nothing
+    raised. ``q_sample`` would keep returning plausible finite values while
+    ``p_sample_loop`` divided by a corrupted ``sqrt(alphas)``.
+
+    Torch has no read-only tensor, so this is a documented contract rather than
+    an enforced one. The test exists so the contract is visible and so that
+    anyone who later adds real protection has something to update deliberately.
+    """
+    first = _derived("linear", 64, dtype=torch.float32)
+    assert first is _derived("linear", 64, dtype=torch.float32)
+
+    original = first.betas.clone()
+    try:
+        first.betas.mul_(0.0)
+        again = _derived("linear", 64, dtype=torch.float32)
+        assert again.betas.abs().max().item() == 0.0, "expected shared mutable state"
+        assert not torch.allclose(again.alphas, 1.0 - again.betas), (
+            "expected the tuple to be internally inconsistent after the write"
+        )
+    finally:
+        first.betas.copy_(original)
+
+
+def test_default_betas_validates_before_consulting_its_cache():
+    """A warm cache must not let a bad argument through.
+
+    ``int(timesteps)`` turns True into 1 and 1000.7 into 1000, so a key can be
+    built for an argument that ``make_beta_schedule`` would reject — and on a
+    warm cache that check is never reached.
+    """
+    default_betas("linear", 1)
+    default_betas("linear", DEFAULT_TIMESTEPS)
+
+    for bad in (True, 1000.7, 2.5):
+        with pytest.raises(ValueError):
+            default_betas("linear", bad)
 
 
 def test_repeated_calls_hit_the_cache():
@@ -210,8 +269,17 @@ def test_p_losses_scores_the_noise_not_the_image(tiny_model, x0):
     The behavioural file cannot see this: a loss scored against ``x0``, or one
     reduced with ``sum``, or a model called without ``t``, all still produce a
     finite order-one scalar with gradients flowing.
+
+    The timesteps here must be **distinct per sample**, and that is the whole
+    point of the vector below. With a constant ``t`` this test is blind to
+    every way of corrupting the timestep that preserves its value: permuting
+    ``t`` across the batch, replacing it with a constant, or clamping the
+    schedule so an untrained range is never sampled. All of those pass the
+    entire rest of the suite too — `test_gradients_reach_the_timestep_embedding`
+    does not catch them, because destroying the timestep makes the embedding's
+    gradient *larger*, not zero.
     """
-    t = torch.full((x0.shape[0],), 300, dtype=torch.long)
+    t = torch.tensor([0, 7, 137, 300, 512, 743, 900, 999], dtype=torch.long)[: x0.shape[0]]
 
     torch.manual_seed(5)
     actual = p_losses(tiny_model, x0, t)
@@ -289,3 +357,66 @@ def test_sampling_refuses_a_device_the_model_is_not_on(tiny_model):
     """Otherwise this surfaces as a RuntimeError from inside the first forward."""
     with pytest.raises(ValueError):
         p_sample_loop(tiny_model, (1, 1, 8, 8), device=torch.device("meta"))
+
+
+def test_sampling_accepts_an_unindexed_form_of_the_models_own_device(tiny_model):
+    """`torch.device("cpu") != torch.device("cpu", 0)`, and .to() reports the latter.
+
+    The regression this guards is a device check that compares the two forms
+    naively. `train.pick_device` returns the unindexed form while model
+    parameters report the indexed one, so such a check rejects the one device
+    the caller definitely got right, and takes the entire GPU path down.
+    """
+    parameter_device = next(tiny_model.parameters()).device
+    for form in {parameter_device, torch.device(parameter_device.type)}:
+        out = p_sample_loop(tiny_model, (1, 1, 8, 8), device=form)
+        assert out.shape == (1, 1, 8, 8)
+
+
+class _PointMassOracle(torch.nn.Module):
+    """The optimal denoiser when the data is a single point, ``x0 = value``.
+
+    For a point mass the posterior mean of ``x_0`` is that point regardless of
+    ``x_t``, so the optimal noise estimate is whatever noise would have carried
+    ``value`` to the observed ``x_t``: ``(x_t - sqrt(abar) * value) / sqrt(1 - abar)``.
+    """
+
+    def __init__(self, value: float = 0.5):
+        super().__init__()
+        self.unused = torch.nn.Parameter(torch.zeros(1))
+        self.value = value
+        schedule = _derived(dtype=torch.float64)
+        self.register_buffer("sqrt_ab", schedule.sqrt_alpha_bars.float())
+        self.register_buffer("sqrt_1mab", schedule.sqrt_one_minus_alpha_bars.float())
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        index = t.reshape(-1, 1, 1, 1)
+        return (x - self.sqrt_ab[index] * self.value) / self.sqrt_1mab[index]
+
+
+@pytest.mark.slow
+def test_sampling_collapses_onto_a_point_mass():
+    """A known-answer test the N(0, I) oracle cannot provide.
+
+    ``test_sampling.py``'s oracle uses standard Gaussian data, which is the
+    worst possible probe for this recursion: Ho et al. note that the *other*
+    variance choice is optimal for exactly that distribution, so the check is
+    graded against the branch this code does not take. Measured, it fails to
+    catch any of the classic alpha-swap or off-by-one errors — every one of
+    them lands within its tolerance.
+
+    A point mass is the opposite extreme. The reverse chain has to contract a
+    unit-variance start down to essentially zero variance over a thousand
+    steps and land exactly on the point, which the wrong coefficients miss by
+    orders of magnitude rather than by percent.
+    """
+    torch.manual_seed(17)
+    out = p_sample_loop(_PointMassOracle(0.5).eval(), (16, 1, 8, 8), device=torch.device("cpu"))
+
+    assert torch.isfinite(out).all()
+    assert abs(out.mean().item() - 0.5) < 1e-3, (
+        f"chain settled at {out.mean().item():.6f}, not on the point mass at 0.5"
+    )
+    assert out.std().item() < 1e-4, (
+        f"residual std {out.std().item():.3e} — the chain is not contracting"
+    )

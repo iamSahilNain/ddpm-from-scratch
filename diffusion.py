@@ -3,9 +3,7 @@
 This module is the *point* of the project. Everything else in the repo —
 the UNet, the dataloader, the training loop, the plotting helpers — is
 scaffolding that exists so that these four functions have something to be
-plugged into. Two of them are now written: :func:`make_beta_schedule` and
-:func:`q_sample`. :func:`p_losses` and :func:`p_sample_loop` are still
-deliberately left unimplemented.
+plugged into. All four are now written.
 
 The docstrings below are contracts, not hints: they fix the shapes, dtypes,
 indexing convention and mathematical meaning that the rest of the repo (and
@@ -203,18 +201,38 @@ def q_sample(x0: Tensor, t: Tensor, noise: Tensor) -> Tensor:
             f"x0 must be floating point, got {x0.dtype}; an integer dtype would "
             "truncate every schedule coefficient to zero"
         )
+    if noise.shape != x0.shape or noise.dtype != x0.dtype:
+        raise ValueError(
+            f"noise must match x0 in shape and dtype; got {tuple(noise.shape)}/"
+            f"{noise.dtype} against {tuple(x0.shape)}/{x0.dtype}"
+        )
     if t.dim() != 1:
         raise ValueError(f"t must be one-dimensional, shape (B,), got {tuple(t.shape)}")
+    if t.dtype not in (torch.int64, torch.int32, torch.int16, torch.uint8):
+        # A bool tensor would be read as a mask rather than as indices, which
+        # for B == T silently returns a full-shape tensor built from one value.
+        raise TypeError(f"t must be an integer tensor, got {t.dtype}")
+    if t.shape[0] != x0.shape[0]:
+        # A length-one t against a longer batch broadcasts happily and noises
+        # every image to the same timestep — the "I forgot to expand t" bug.
+        raise ValueError(
+            f"t has length {t.shape[0]} but the batch is {x0.shape[0]}; "
+            "one timestep per image is required"
+        )
 
     schedule = _derived(device=x0.device, dtype=x0.dtype)
     timesteps = schedule.alpha_bars.shape[0]
-    # Torch would wrap a negative index round to the far end of the schedule,
-    # turning "one step before the start" into "fully destroyed" in silence.
-    if t.numel() and (int(t.min()) < 0 or int(t.max()) >= timesteps):
-        raise IndexError(
-            f"t must lie in [0, {timesteps}), got [{int(t.min())}, {int(t.max())}]; "
-            f"the process-global schedule has {timesteps} steps"
-        )
+    if t.numel():
+        # One device sync rather than two: t.min() and t.max() separately cost
+        # a measurable stall per training step on MPS.
+        low, high = (int(bound) for bound in torch.aminmax(t))
+        # Torch would wrap a negative index round to the far end of the
+        # schedule, turning "one step before the start" into "fully destroyed".
+        if low < 0 or high >= timesteps:
+            raise IndexError(
+                f"t must lie in [0, {timesteps}), got [{low}, {high}]; "
+                f"the process-global schedule has {timesteps} steps"
+            )
 
     index = t.to(schedule.sqrt_alpha_bars.device)
     view = (-1,) + (1,) * (x0.dim() - 1)
@@ -282,12 +300,26 @@ def p_losses(model: torch.nn.Module, x0: Tensor, t: Tensor) -> Tensor:
     # Drawn here rather than taken as an argument: the target has to be fresh
     # every call, or the model is scored against a noise sample it has already
     # seen for this image and the objective stops being an expectation.
+    if x0.numel() == 0:
+        # mse_loss over nothing is 0/0. The contract promises a finite scalar,
+        # so refuse rather than hand back a nan that poisons the first step.
+        raise ValueError("x0 is empty; the loss over an empty batch is undefined")
+
     noise = torch.randn_like(x0)
     x_t = q_sample(x0, t, noise)
     # `t` goes to the model as well as to q_sample. Without it the timestep MLP
     # sits outside the graph, and the network quietly learns one average
     # denoiser for every noise level.
     predicted_noise = model(x_t, t)
+    if predicted_noise.shape != noise.shape:
+        # mse_loss broadcasts, so a model returning (B, 1, 1, 1) or a bare
+        # scalar scores a plausible ~1.0 and trains to nothing. Torch only
+        # warns, and pytest.ini suppresses UserWarning.
+        raise ValueError(
+            f"model returned {tuple(predicted_noise.shape)}, expected "
+            f"{tuple(noise.shape)}; a broadcastable shape would score a "
+            "plausible loss and train nothing"
+        )
     return torch.nn.functional.mse_loss(predicted_noise, noise)
 
 
@@ -362,23 +394,35 @@ def p_sample_loop(
     directly. Forgetting this leaves a visible layer of grain over every sample
     and is by far the most common bug in this function.
     """
-    parameter_device = next(model.parameters()).device
+    try:
+        parameter = next(model.parameters())
+    except StopIteration:
+        raise ValueError(
+            "model has no parameters, so its device cannot be inferred; "
+            "pass device= explicitly"
+        ) from None
+
     if device is None:
-        device = parameter_device
+        device = parameter.device
     device = torch.device(device)
-    if device != parameter_device:
+
+    # Compare canonicalised devices. `torch.device("mps") != torch.device("mps", 0)`,
+    # but a model moved with .to("mps") reports mps:0 — so a naive comparison
+    # rejects `pick_device("auto")` handing back exactly the right device, and
+    # takes the whole GPU path down with it.
+    if _canonical_device(device) != _canonical_device(parameter.device):
         raise ValueError(
             f"cannot sample on {device} with a model whose parameters live on "
-            f"{parameter_device}; move the model first"
+            f"{parameter.device}; move the model first"
         )
 
-    schedule = _derived(device=device, dtype=torch.float32)
+    schedule = _derived(device=device, dtype=parameter.dtype)
     timesteps = schedule.alpha_bars.shape[0]
 
     # x_T. Legitimate only because the final alpha_bar is negligible, which is
     # what make_beta_schedule had to earn. Pinned to `device` rather than left
     # to `torch.set_default_device`.
-    x = torch.randn(tuple(shape), device=device)
+    x = torch.randn(tuple(shape), device=device, dtype=parameter.dtype)
 
     for step in reversed(range(timesteps)):
         t = torch.full((x.shape[0],), step, dtype=torch.long, device=device)
@@ -419,6 +463,13 @@ def default_betas(kind: str = "linear", timesteps: int = DEFAULT_TIMESTEPS) -> T
     rebuild the schedule on every call. Like every buffer in this module, the
     tensor it returns is shared and must not be mutated in place.
     """
+    # Validate before the key is built. `int(timesteps)` would happily turn
+    # True into 1 and 1000.7 into 1000, and on a warm cache that never reaches
+    # make_beta_schedule's own check — so the same bad argument raises or
+    # silently succeeds depending on what has been called before.
+    if isinstance(timesteps, bool) or int(timesteps) != timesteps:
+        raise ValueError(f"timesteps must be an integer, got {timesteps!r}")
+
     key = (kind, int(timesteps))
     if key not in _BETA_CACHE:
         _BETA_CACHE[key] = make_beta_schedule(kind, timesteps)
@@ -428,6 +479,17 @@ def default_betas(kind: str = "linear", timesteps: int = DEFAULT_TIMESTEPS) -> T
 # --------------------------------------------------------------------------- #
 # Checkpoint work again below — the buffers the four functions above read from.
 # --------------------------------------------------------------------------- #
+
+
+def _canonical_device(device) -> torch.device:
+    """Resolve a device to the indexed form torch actually places tensors on.
+
+    ``torch.device("mps")`` and ``torch.device("mps", 0)`` compare unequal but
+    name the same hardware, and ``.to(...)`` always reports the indexed form.
+    Allocating a zero-element tensor is the cheap, backend-agnostic way to ask
+    torch which one it means.
+    """
+    return torch.empty(0, device=torch.device(device)).device
 
 
 class _Derived(NamedTuple):
@@ -467,10 +529,18 @@ def _derived(
       ``alpha_bar`` is 4.0e-05, comfortably above the smallest subnormal — but
       the cosine schedule does not: its final ``alpha_bar`` is 2.4e-09 and
       flushes to exactly zero, which would make the mean coefficient vanish at
-      the last step. Taking the square roots before the cast rescues it, since
-      1.5e-05 is representable where its square is not.
-    - float64 keeps the cumulative product accurate for float64 callers, who
-      would otherwise silently receive float32-accurate coefficients.
+      the last step. Taking the square roots before the cast rescues *that*
+      coefficient, since ``sqrt(2.4e-09)`` is 4.9e-05 and representable where
+      its square is not. Note the limit of the trick: the ``alpha_bars`` field
+      itself is still exactly zero for cosine in float16, because no ordering
+      can make an unrepresentable number representable. Consumers wanting
+      ``alpha_bar`` at low precision should read the square-root fields.
+    - float64 keeps the cumulative product itself accurate. It does not buy
+      absolute accuracy: :func:`make_beta_schedule` returns float32 by
+      contract, so a float64 caller still inherits float32-rounded betas and
+      lands about 2e-07 relative from a true float64 derivation. What it
+      removes is the compounding error of a thousand-term product taken in the
+      caller's precision.
 
     Note that autocast is not the case this protects against: under
     ``torch.autocast`` the tensors handed to :func:`q_sample` stay float32, so
@@ -499,9 +569,15 @@ def _derived(
             alpha_bars_prev=alpha_bars_prev,
             posterior_variance=betas * (1.0 - alpha_bars_prev) / (1.0 - alpha_bars),
         )
-        # `.to` is a no-op returning the same object when the dtype and device
-        # already match, which would alias these buffers to `_BETA_CACHE` and
-        # let one caller's in-place edit poison the schedule process-wide.
+        # The `.clone()` is belt-and-braces, not load-bearing: the float64 cast
+        # above already copies, so nothing here can alias `_BETA_CACHE` even
+        # when the requested dtype and device match. It is kept so that the
+        # guarantee survives someone later making the derivation float32.
+        #
+        # What it does NOT do is protect callers from each other. Every caller
+        # gets the same objects, so an in-place write corrupts the schedule
+        # process-wide and desynchronises the tuple's own fields. See the
+        # read-only note above; there is no cheap way to enforce it in torch.
         _DERIVED_CACHE[key] = _Derived(
             *(buffer.to(device=device, dtype=dtype).clone() for buffer in buffers)
         )

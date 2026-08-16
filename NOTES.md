@@ -89,3 +89,59 @@ uncomfortable one, because `test_gradients_reach_the_timestep_embedding` is
 written to catch exactly it and does not: feeding constant zeros still sends
 gradient through the embedding.
 
+2026-08-16 — adversarial review of checkpoints 2, 3 and 4. The maths came
+through clean on all three: the forward marginal matches Ho eq. 4 to 1.7e-08
+against both a hand derivation and a brute-force chain, the objective is Eq. 14
+up to the documented 1/D from using a mean instead of a sum, and the reverse
+recursion was confirmed against sympy, an independent reimplementation from the
+paper, and two known-answer tests on distributions the repo never uses. The
+defects were all in the scaffolding I had added around the maths, and the two
+worst were self-inflicted by the previous round.
+
+The bad one: the device guard I added to `p_sample_loop` broke the entire GPU
+path. `torch.device("mps") != torch.device("mps", 0)`, and `pick_device("auto")`
+returns the unindexed form while `.to()` reports the indexed one — so the guard
+rejected exactly the device the caller had got right. `python train.py` on this
+machine died at the first sample write and `sample.py --device mps` never ran;
+only `--device cpu` worked. My own end-to-end check missed it because I had
+pinned `device="cpu"` in the synthetic run. A guard that turns a clear failure
+into a broken default is worse than no guard; canonicalise with
+`torch.empty(0, device=d).device` before comparing.
+
+The worse one: `test_buffers_are_not_aliased_to_the_beta_cache` restored the
+shared buffer with `add_(1.0)` then `sub_(1.0)`, which does not round-trip in
+float32 — 993 of 1000 betas came back perturbed, `beta[0]` by 2.5e-04 relative.
+Because `_derived` hands every caller the same tensors, that poisoned the
+schedule for the rest of the process, and the poisoned buffer was then read by
+the one test guarding the recursion's coefficients. Measured: a sampler that
+skips its final step deviates 2.04e-04 on a clean cache and fails, and 9.06e-05
+on the poisoned one and passes. Run as a full suite, the recursion had zero
+effective coverage. Restore with `copy_`.
+
+Also fixed: `default_betas` built its cache key before validating, so the same
+bad argument raised on a cold cache and silently returned a 1-step schedule on a
+warm one; `q_sample` accepted a length-1 `t` against a longer batch and noised
+every image to the same timestep; `noise` of a different dtype silently changed
+the return dtype; a bool `t` became mask indexing; `p_losses` returned nan on an
+empty batch and accepted any broadcast-compatible model output, scoring a
+plausible ~1.0 for a model returning a scalar. The range check now does one
+device sync instead of two — the pair cost 10.6x on MPS for small tensors.
+
+Two documentation corrections. The `_derived` docstring said the float64
+ordering rescues the cosine schedule in float16 and quoted 1.5e-05; the real
+figure is 4.93e-05, and the rescue only covers the precomputed square roots —
+the `alpha_bars` field itself is still exactly zero, because no ordering makes
+an unrepresentable number representable. And `test_sampling.py` claimed its
+Gaussian oracle catches swapped alpha terms and off-by-one loop bounds "by a
+factor of a hundred or more"; measured, it catches none of seven such mutants,
+all landing within its tolerance. N(0,I) is the worst possible probe, since the
+paper says `beta_t` is optimal for exactly that distribution and this code uses
+`beta-tilde`. I had repeated that claim in the README. Replaced with a
+point-mass oracle, which the wrong coefficients miss by orders of magnitude.
+
+The highest-value single edit in the round was one line: the `t` in the
+`p_losses` pin was a constant vector, `full((B,), 300)`. Making it varied killed
+five real mutants at once — conditioning replaced by a constant, `t` permuted
+across the batch, and three clampings that leave part of the schedule untrained.
+Every one of them had passed all 98 tests.
+
