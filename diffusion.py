@@ -37,7 +37,8 @@ surface `tests/` and `train.py` touch.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+import math
+from typing import NamedTuple, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -114,7 +115,27 @@ def make_beta_schedule(kind: str = "linear", timesteps: int = DEFAULT_TIMESTEPS)
     negligible then ``x_T`` still carries image information that sampling has
     no way to supply.
     """
-    raise NotImplementedError("checkpoint 1: implement the beta schedule")
+    timesteps = int(timesteps)
+    if timesteps < 1:
+        raise ValueError(f"timesteps must be at least one, got {timesteps}")
+
+    if kind == "linear":
+        return torch.linspace(1e-4, 0.02, timesteps, dtype=torch.float32)
+
+    if kind == "cosine":
+        # Nichol & Dhariwal (2021), eq. 17. The offset keeps beta_0 away from
+        # zero; f is evaluated at T + 1 points so that consecutive alpha_bars
+        # can be divided out into per-step betas.
+        offset = 0.008
+        steps = torch.arange(timesteps + 1, dtype=torch.float64)
+        f = torch.cos(((steps / timesteps) + offset) / (1.0 + offset) * math.pi / 2.0) ** 2
+        alpha_bars = f / f[0]
+        betas = 1.0 - alpha_bars[1:] / alpha_bars[:-1]
+        # The tail of the cosine schedule runs beta arbitrarily close to one,
+        # which would collapse every later alpha_bar to zero outright.
+        return betas.clamp(max=0.999).to(torch.float32)
+
+    raise ValueError(f"unknown schedule kind {kind!r}; expected 'linear' or 'cosine'")
 
 
 def q_sample(x0: Tensor, t: Tensor, noise: Tensor) -> Tensor:
@@ -168,7 +189,13 @@ def q_sample(x0: Tensor, t: Tensor, noise: Tensor) -> Tensor:
     Gaussian almost regardless of ``x_0``, because the mean coefficient has
     decayed to nearly nothing.
     """
-    raise NotImplementedError("checkpoint 2: implement the forward marginal")
+    schedule = _derived(device=x0.device, dtype=x0.dtype)
+    index = t.to(schedule.sqrt_alpha_bars.device)
+    view = (-1,) + (1,) * (x0.dim() - 1)
+
+    mean_coefficient = schedule.sqrt_alpha_bars[index].view(view)
+    std = schedule.sqrt_one_minus_alpha_bars[index].view(view)
+    return mean_coefficient * x0 + std * noise
 
 
 def p_losses(model: torch.nn.Module, x0: Tensor, t: Tensor) -> Tensor:
@@ -321,3 +348,47 @@ def default_betas(kind: str = "linear", timesteps: int = DEFAULT_TIMESTEPS) -> T
     if key not in _BETA_CACHE:
         _BETA_CACHE[key] = make_beta_schedule(kind, timesteps)
     return _BETA_CACHE[key]
+
+
+class _Derived(NamedTuple):
+    """The schedule and everything the forward and reverse processes read off it."""
+
+    betas: Tensor
+    alphas: Tensor
+    alpha_bars: Tensor
+    sqrt_alpha_bars: Tensor
+    sqrt_one_minus_alpha_bars: Tensor
+
+
+_DERIVED_CACHE: dict[tuple, _Derived] = {}
+
+
+def _derived(
+    kind: str = "linear",
+    timesteps: int = DEFAULT_TIMESTEPS,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> _Derived:
+    """Cached schedule buffers, already on the device and in the dtype asked for.
+
+    The derivation always runs in float32 on the CPU before being cast: a
+    cumulative product over a thousand terms underflows to zero in float16, so
+    computing it in the caller's dtype would silently break autocast training.
+    """
+    device = torch.device("cpu") if device is None else torch.device(device)
+    key = (kind, int(timesteps), str(device), dtype)
+    if key not in _DERIVED_CACHE:
+        betas = default_betas(kind, timesteps)
+        alphas = 1.0 - betas
+        alpha_bars = torch.cumprod(alphas, dim=0)
+        buffers = _Derived(
+            betas=betas,
+            alphas=alphas,
+            alpha_bars=alpha_bars,
+            sqrt_alpha_bars=alpha_bars.sqrt(),
+            sqrt_one_minus_alpha_bars=(1.0 - alpha_bars).sqrt(),
+        )
+        _DERIVED_CACHE[key] = _Derived(
+            *(buffer.to(device=device, dtype=dtype) for buffer in buffers)
+        )
+    return _DERIVED_CACHE[key]

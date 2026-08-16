@@ -6,7 +6,8 @@ the diffusion process is written out by hand.
 
 The repo is scaffolding around a hole. The UNet, dataloader, training loop,
 plotting helpers and test suite are complete; the four functions that *are* the
-diffusion model are stubs with contracts and no bodies.
+diffusion model started as stubs with contracts and no bodies. The forward
+process is now filled in — the training objective and the sampler are not.
 
 ## Status
 
@@ -17,7 +18,8 @@ diffusion model are stubs with contracts and no bodies.
 | `train.py` — AMP, EMA, checkpoint/resume, CSV logging | done |
 | `viz.py` / `sample.py` — grids, forward-process strip, loss curve | done |
 | `tests/` — 76 tests | done |
-| `diffusion.py` — the four checkpoint functions | **stubs** |
+| `diffusion.py` — schedule, forward marginal | done |
+| `diffusion.py` — training objective, sampler | **stubs** |
 
 ## Setup
 
@@ -31,15 +33,23 @@ the diffusion code, the whole test suite — runs without it.
 ## The checkpoint
 
 Four functions in [`diffusion.py`](diffusion.py), each with a docstring stating
-its exact contract (shapes, dtypes, indexing, and what the maths has to mean)
-and a `raise NotImplementedError`:
+its exact contract (shapes, dtypes, indexing, and what the maths has to mean).
+The two still carrying a `raise NotImplementedError` are marked:
 
 1. `make_beta_schedule(kind, timesteps)` — the variance schedule everything else
-   is derived from.
+   is derived from. Done: linear (Ho et al.) and cosine (Nichol & Dhariwal).
 2. `q_sample(x0, t, noise)` — the closed-form forward marginal: jump from a
-   clean image to any timestep in one shot.
-3. `p_losses(model, x0, t)` — the simplified noise-prediction training objective.
-4. `p_sample_loop(model, shape)` — ancestral sampling, noise to image.
+   clean image to any timestep in one shot. Done.
+3. `p_losses(model, x0, t)` — the simplified noise-prediction training
+   objective. **Stub.**
+4. `p_sample_loop(model, shape)` — ancestral sampling, noise to image. **Stub.**
+
+The derived quantities the schedule feeds — `alphas`, `alpha_bars` and the two
+square-root terms — are cached per `(kind, timesteps, device, dtype)` by the
+private `_derived` helper, which is what `q_sample` reads and what the
+remaining two functions should read too. The derivation runs in float32 on the
+CPU and is cast afterwards, because a thousand-term cumulative product
+underflows to zero in float16.
 
 Timesteps are zero-indexed throughout: `t = 0` is the first, gentlest noising
 step and `t = T - 1` is the last. The tests assume this.
@@ -54,9 +64,12 @@ alone, so leave it until the first three are solid.
 pytest
 ```
 
-Every test in `tests/test_model.py` passes today; everything else fails with
-`NotImplementedError` until the stubs are filled in. That is the intended
-starting state — the red tests are the specification.
+`test_model.py`, `test_schedule.py` and `test_q_sample.py` pass today —
+48 passed, 11 failed, 2 skipped on `pytest -m "not slow"`. The failures are all
+of `test_losses.py`, plus `test_sampling.py` and `test_overfit.py` once the
+slow marker is included; every one of them is a `NotImplementedError` from
+checkpoint 3 or 4. The two skips are the optional `quadratic` and `sigmoid`
+schedules, which correctly raise `ValueError`.
 
 Skip the two slow files (full thousand-step sampling chains and an optimisation
 loop, about a minute together):
@@ -126,7 +139,7 @@ per-step trace is dominated by which timesteps happened to be drawn.
 ## Layout
 
 ```
-diffusion.py   the four stubs — forward process, objective, sampler
+diffusion.py   forward process (done), objective and sampler (stubs)
 model.py       UNet, sinusoidal timestep embedding, FiLM-conditioned res blocks
 data.py        MNIST at [-1, 1], plus a synthetic batch for tests
 train.py       training loop, EMA, AMP, checkpointing, CSV logging
