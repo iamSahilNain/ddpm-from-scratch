@@ -17,7 +17,7 @@ process is now filled in — the training objective and the sampler are not.
 | `data.py` — MNIST, normalised to the range −1…1 | done |
 | `train.py` — AMP, EMA, checkpoint/resume, CSV logging | done |
 | `viz.py` / `sample.py` — grids, forward-process strip, loss curve | done |
-| `tests/` — 76 tests | done |
+| `tests/` — 95 tests | done |
 | `diffusion.py` — schedule, forward marginal | done |
 | `diffusion.py` — training objective, sampler | **stubs** |
 
@@ -47,9 +47,12 @@ The two still carrying a `raise NotImplementedError` are marked:
 The derived quantities the schedule feeds — `alphas`, `alpha_bars` and the two
 square-root terms — are cached per `(kind, timesteps, device, dtype)` by the
 private `_derived` helper, which is what `q_sample` reads and what the
-remaining two functions should read too. The derivation runs in float32 on the
-CPU and is cast afterwards, because a thousand-term cumulative product
-underflows to zero in float16.
+remaining two functions should read too. The derivation runs in float64 on the
+CPU and is cast only at the end, so the square roots are taken before any
+precision is lost. That matters for the cosine schedule, whose final
+`alpha_bar` of 2.4e-09 flushes to exactly zero in float16 while its square root
+of 4.9e-05 survives; the linear schedule bottoms out at 4.0e-05 and is never in
+danger. The buffers are shared process-wide and must be treated as read-only.
 
 Timesteps are zero-indexed throughout: `t = 0` is the first, gentlest noising
 step and `t = T - 1` is the last. The tests assume this.
@@ -64,12 +67,14 @@ alone, so leave it until the first three are solid.
 pytest
 ```
 
-`test_model.py`, `test_schedule.py` and `test_q_sample.py` pass today —
-48 passed, 11 failed, 2 skipped on `pytest -m "not slow"`. The failures are all
-of `test_losses.py`, plus `test_sampling.py` and `test_overfit.py` once the
-slow marker is included; every one of them is a `NotImplementedError` from
-checkpoint 3 or 4. The two skips are the optional `quadratic` and `sigmoid`
-schedules, which correctly raise `ValueError`.
+`test_model.py`, `test_schedule.py`, `test_q_sample.py` and `test_derived.py`
+pass today — 67 passed, 11 failed, 2 skipped on `pytest -m "not slow"`, out of
+95 collected. The failures are all of `test_losses.py`. Include the slow marker
+and `test_sampling.py` and `test_overfit.py` join them, taking it to 22 failed
+and 4 errors — the errors are `test_overfit.py`'s module-scoped fixture raising
+during setup rather than the tests themselves failing. All 26 are a
+`NotImplementedError` from checkpoint 3 or 4. The two skips are the optional
+`quadratic` and `sigmoid` schedules, which correctly raise `ValueError`.
 
 Skip the two slow files (full thousand-step sampling chains and an optimisation
 loop, about a minute together):
@@ -87,7 +92,16 @@ What the suite checks, beyond shapes and finiteness:
   image; the last is standard Gaussian and has forgotten the input entirely;
   correlation with the clean image falls monotonically in between. Nothing here
   recomputes the closed form, so passing means the *process* is right rather
-  than that it matches one particular arrangement of square roots.
+  than that it matches one particular arrangement of square roots. Be clear
+  about what that costs: mutation testing says `mean = alpha_bar` instead of
+  `sqrt(alpha_bar)`, a `+1` index shift, and `q_sample` running on the cosine
+  schedule while everything else runs on linear all pass all thirteen tests.
+  The behavioural suite specifies the process; it does not pin the function.
+- **`test_derived.py`** — which is what pins it, now that the function exists.
+  Recomputes the closed form in float64, asserts `q_sample` reads the same
+  schedule `make_beta_schedule` produces, and covers the cache and the input
+  contracts. All three mutants above die here. Kept in a separate file so
+  `test_q_sample.py` stays a specification rather than a regression net.
 - **`test_losses.py`** — a finite scalar, reduced as a mean rather than a sum,
   with gradients reaching every parameter including the timestep embedding.
 - **`test_sampling.py`** — structural checks, plus one test with real teeth:
@@ -103,7 +117,7 @@ Two deliberate notes on what the tests do *not* do:
   cumulative products from the betas. It has to: `make_beta_schedule` returns
   only the betas, and the properties worth asserting are properties of the
   products. It restates what the docstring already says in prose. Delete it and
-  the four tests using it if you would rather work with nothing in front of you.
+  the five tests using it if you would rather work with nothing in front of you.
 - No test asserts anything about the *magnitude* of samples from an untrained
   model. The reverse process is only contractive once the network actually
   predicts noise; with random weights a correct implementation drifts into the
@@ -125,13 +139,14 @@ python sample.py --checkpoint runs/mnist/checkpoints/last.pt -n 64
 ```
 
 Mixed precision turns itself on only for CUDA. On MPS and CPU the speedup on a
-model this small does not justify the numerics, so `--amp` is a no-op there.
+model this small does not justify the numerics, so it stays off there whether or
+not `--no-amp` is passed.
 
 Sampling defaults to the EMA weights. They are worth having: the live weights at
 any given step look distinctly worse than the loss curve suggests.
 
-The default model is about 6.8M parameters (3 levels, base width 64, attention
-at 14×14 and 7×7). `--base-channels 32` gives 1.7M and trains acceptably.
+The default model is 7,278,401 parameters (3 levels, base width 64, attention
+at 14×14 and 7×7). `--base-channels 32` gives 1,826,721 and trains acceptably.
 
 Read the loss curve smoothed — `viz.plot_loss_curve` does this — because the raw
 per-step trace is dominated by which timesteps happened to be drawn.
@@ -145,25 +160,37 @@ data.py        MNIST at [-1, 1], plus a synthetic batch for tests
 train.py       training loop, EMA, AMP, checkpointing, CSV logging
 sample.py      generate from a checkpoint
 viz.py         image grids, forward-process strip, loss curve
-tests/         pytest suite
+tests/         pytest suite; test_derived.py pins the forward process
 NOTES.md       build log
 ```
 
 ## A note on the architecture
 
 The residual blocks condition on the timestep with a learned scale and shift
-applied *after* the group norm (the adaptive group norm of Nichol & Dhariwal,
-2021), not by adding the embedding before it as the original DDPM code does.
-This is not a stylistic preference. A per-channel constant added before a
-normalisation layer is partly — and at narrow widths exactly — subtracted back
-out by that layer, at which point the network is silently unconditional. It
-still trains to a plausible loss and samples pure mush. This repo hit that
-during construction: `test_the_timestep_actually_changes_the_output` caught it
-with a max output difference of 1e-6 between `t = 0` and `t = 999`.
+applied *after* the group norm (the mechanism described in Nichol & Dhariwal
+2021's appendix, and named AdaGN a few months later in Dhariwal & Nichol 2021),
+not by adding the embedding before it as the original DDPM code does. This is
+not a stylistic preference. A per-channel constant added before a normalisation
+layer is partly subtracted back out by that layer, at which point the network
+is silently unconditional. It still trains to a plausible loss and samples pure
+mush. This repo hit that during construction:
+`test_the_timestep_actually_changes_the_output` caught it with a max output
+difference of 1e-6 between `t = 0` and `t = 999`.
+
+How complete the cancellation is depends on the grouping, and the 1e-6 figure
+is the worst case: it needs one channel per group, where group norm degenerates
+into instance norm and the constant is removed exactly. At the groupings
+`_group_norm` can actually produce — it enforces at least four channels per
+group — a pre-norm constant survives, with a t=0 versus t=999 difference around
+0.14. So the trap is narrower than the anecdote suggests, and `min_per_group`
+is now what keeps the repo out of it.
 
 ## References
 
 - Ho, Jain, Abbeel, *Denoising Diffusion Probabilistic Models*, 2020 —
   arXiv:2006.11239. The linear schedule endpoints and the simplified objective.
 - Nichol, Dhariwal, *Improved Denoising Diffusion Probabilistic Models*, 2021 —
-  arXiv:2102.09672. Cosine schedule, adaptive group norm.
+  arXiv:2102.09672. Cosine schedule (eq. 17), and the post-norm scale-and-shift
+  conditioning in appendix A.
+- Dhariwal, Nichol, *Diffusion Models Beat GANs on Image Synthesis*, 2021 —
+  arXiv:2105.05233. Where that conditioning is actually named AdaGN.

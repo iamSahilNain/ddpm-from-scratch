@@ -147,6 +147,15 @@ def save_forward_process_grid(
     from diffusion import DEFAULT_TIMESTEPS, q_sample
 
     total = total_timesteps or DEFAULT_TIMESTEPS
+    if total != DEFAULT_TIMESTEPS:
+        # q_sample indexes the process-global schedule, so picking columns from
+        # a different length would noise t=99 of a nominal 100-step run with the
+        # 1000-step coefficients — a last column still showing the digit, which
+        # is exactly the bug signature this function advertises catching.
+        raise ValueError(
+            f"total_timesteps={total} does not match the process-global schedule "
+            f"of {DEFAULT_TIMESTEPS} steps; the strip would misreport."
+        )
     if timesteps is None:
         timesteps = torch.linspace(0, total - 1, steps=8).round().long().tolist()
 

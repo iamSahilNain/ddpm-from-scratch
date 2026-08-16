@@ -3,7 +3,9 @@
 This module is the *point* of the project. Everything else in the repo —
 the UNet, the dataloader, the training loop, the plotting helpers — is
 scaffolding that exists so that these four functions have something to be
-plugged into. They are deliberately left unimplemented.
+plugged into. Two of them are now written: :func:`make_beta_schedule` and
+:func:`q_sample`. :func:`p_losses` and :func:`p_sample_loop` are still
+deliberately left unimplemented.
 
 The docstrings below are contracts, not hints: they fix the shapes, dtypes,
 indexing convention and mathematical meaning that the rest of the repo (and
@@ -115,19 +117,26 @@ def make_beta_schedule(kind: str = "linear", timesteps: int = DEFAULT_TIMESTEPS)
     negligible then ``x_T`` still carries image information that sampling has
     no way to supply.
     """
+    # Truncating a float here would hand back a schedule of a length the caller
+    # never asked for, so anything non-integral is rejected rather than coerced.
+    if isinstance(timesteps, bool) or int(timesteps) != timesteps:
+        raise ValueError(f"timesteps must be an integer, got {timesteps!r}")
     timesteps = int(timesteps)
     if timesteps < 1:
         raise ValueError(f"timesteps must be at least one, got {timesteps}")
 
+    # Every tensor below is pinned to the CPU: the contract promises a CPU
+    # tensor, and `torch.set_default_device` would otherwise silently move the
+    # schedule — onto MPS, where the float64 cosine cannot even be built.
     if kind == "linear":
-        return torch.linspace(1e-4, 0.02, timesteps, dtype=torch.float32)
+        return torch.linspace(1e-4, 0.02, timesteps, dtype=torch.float32, device="cpu")
 
     if kind == "cosine":
         # Nichol & Dhariwal (2021), eq. 17. The offset keeps beta_0 away from
         # zero; f is evaluated at T + 1 points so that consecutive alpha_bars
         # can be divided out into per-step betas.
         offset = 0.008
-        steps = torch.arange(timesteps + 1, dtype=torch.float64)
+        steps = torch.arange(timesteps + 1, dtype=torch.float64, device="cpu")
         f = torch.cos(((steps / timesteps) + offset) / (1.0 + offset) * math.pi / 2.0) ** 2
         alpha_bars = f / f[0]
         betas = 1.0 - alpha_bars[1:] / alpha_bars[:-1]
@@ -189,7 +198,24 @@ def q_sample(x0: Tensor, t: Tensor, noise: Tensor) -> Tensor:
     Gaussian almost regardless of ``x_0``, because the mean coefficient has
     decayed to nearly nothing.
     """
+    if not x0.is_floating_point():
+        raise TypeError(
+            f"x0 must be floating point, got {x0.dtype}; an integer dtype would "
+            "truncate every schedule coefficient to zero"
+        )
+    if t.dim() != 1:
+        raise ValueError(f"t must be one-dimensional, shape (B,), got {tuple(t.shape)}")
+
     schedule = _derived(device=x0.device, dtype=x0.dtype)
+    timesteps = schedule.alpha_bars.shape[0]
+    # Torch would wrap a negative index round to the far end of the schedule,
+    # turning "one step before the start" into "fully destroyed" in silence.
+    if t.numel() and (int(t.min()) < 0 or int(t.max()) >= timesteps):
+        raise IndexError(
+            f"t must lie in [0, {timesteps}), got [{int(t.min())}, {int(t.max())}]; "
+            f"the process-global schedule has {timesteps} steps"
+        )
+
     index = t.to(schedule.sqrt_alpha_bars.device)
     view = (-1,) + (1,) * (x0.dim() - 1)
 
@@ -341,13 +367,18 @@ def default_betas(kind: str = "linear", timesteps: int = DEFAULT_TIMESTEPS) -> T
     """Memoised :func:`make_beta_schedule`, for callers that want the default.
 
     Purely a convenience so that `train.py` and the plotting helpers do not
-    rebuild the schedule on every call. It delegates to your implementation and
-    will raise ``NotImplementedError`` until that exists.
+    rebuild the schedule on every call. Like every buffer in this module, the
+    tensor it returns is shared and must not be mutated in place.
     """
     key = (kind, int(timesteps))
     if key not in _BETA_CACHE:
         _BETA_CACHE[key] = make_beta_schedule(kind, timesteps)
     return _BETA_CACHE[key]
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint work again below — the buffers the four functions above read from.
+# --------------------------------------------------------------------------- #
 
 
 class _Derived(NamedTuple):
@@ -371,14 +402,32 @@ def _derived(
 ) -> _Derived:
     """Cached schedule buffers, already on the device and in the dtype asked for.
 
-    The derivation always runs in float32 on the CPU before being cast: a
-    cumulative product over a thousand terms underflows to zero in float16, so
-    computing it in the caller's dtype would silently break autocast training.
+    The derivation runs in float64 on the CPU and is cast only at the end. Two
+    reasons, one of which is *not* the obvious one:
+
+    - Deriving in the caller's dtype would take the cumulative product there
+      too. The linear schedule survives that in float16 — its final
+      ``alpha_bar`` is 4.0e-05, comfortably above the smallest subnormal — but
+      the cosine schedule does not: its final ``alpha_bar`` is 2.4e-09 and
+      flushes to exactly zero, which would make the mean coefficient vanish at
+      the last step. Taking the square roots before the cast rescues it, since
+      1.5e-05 is representable where its square is not.
+    - float64 keeps the cumulative product accurate for float64 callers, who
+      would otherwise silently receive float32-accurate coefficients.
+
+    Note that autocast is not the case this protects against: under
+    ``torch.autocast`` the tensors handed to :func:`q_sample` stay float32, so
+    the low-precision path is reached only by an explicitly halved caller.
+
+    The returned buffers are shared across every caller in the process and must
+    be treated as read-only. Derive from them freely — ``roll``, indexing and
+    arithmetic all copy — but never write into them in place, or the schedule
+    is corrupted for everything downstream with no error raised.
     """
     device = torch.device("cpu") if device is None else torch.device(device)
     key = (kind, int(timesteps), str(device), dtype)
     if key not in _DERIVED_CACHE:
-        betas = default_betas(kind, timesteps)
+        betas = default_betas(kind, timesteps).to(torch.float64)
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
         buffers = _Derived(
@@ -388,7 +437,10 @@ def _derived(
             sqrt_alpha_bars=alpha_bars.sqrt(),
             sqrt_one_minus_alpha_bars=(1.0 - alpha_bars).sqrt(),
         )
+        # `.to` is a no-op returning the same object when the dtype and device
+        # already match, which would alias these buffers to `_BETA_CACHE` and
+        # let one caller's in-place edit poison the schedule process-wide.
         _DERIVED_CACHE[key] = _Derived(
-            *(buffer.to(device=device, dtype=dtype) for buffer in buffers)
+            *(buffer.to(device=device, dtype=dtype).clone() for buffer in buffers)
         )
     return _DERIVED_CACHE[key]

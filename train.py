@@ -178,7 +178,19 @@ def build_model(config: TrainConfig) -> UNet:
 
 
 def train(config: TrainConfig) -> str:
-    from diffusion import p_losses  # imported late so --help works before checkpoint 3
+    from diffusion import DEFAULT_TIMESTEPS, p_losses  # late so --help works pre-checkpoint 3
+
+    # The schedule length is global to the process (see diffusion.py's module
+    # docstring): q_sample and p_sample_loop always use DEFAULT_TIMESTEPS. A
+    # shorter --timesteps would train the model on a fraction of the noise
+    # range and then sample it from pure noise, producing mush with no error
+    # anywhere, so refuse the flag rather than honour it halfway.
+    if config.timesteps != DEFAULT_TIMESTEPS:
+        raise ValueError(
+            f"--timesteps {config.timesteps} is not supported: the diffusion "
+            f"schedule is process-global at {DEFAULT_TIMESTEPS} steps. Training "
+            "on a different length would silently mismatch the sampler."
+        )
 
     torch.manual_seed(config.seed)
     device = pick_device(config.device)
