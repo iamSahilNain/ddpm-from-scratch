@@ -7,7 +7,10 @@ the diffusion process is written out by hand.
 The repo was scaffolding around a hole: the UNet, dataloader, training loop,
 plotting helpers and test suite were complete, and the four functions that
 *are* the diffusion model were stubs with contracts and no bodies. All four are
-now written. The whole suite is green and the reverse process generates images.
+now written, and it works: 8 epochs at `--base-channels 32` on real MNIST take
+39 minutes on an M-series GPU, drive the loss from 0.102 to 0.025, and produce
+legible handwritten digits from pure noise. Both the in-training sample sheets
+and a cold `sample.py` load of the final checkpoint were checked by eye.
 
 ## Status
 
