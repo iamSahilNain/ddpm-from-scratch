@@ -124,8 +124,8 @@ warm one; `q_sample` accepted a length-1 `t` against a longer batch and noised
 every image to the same timestep; `noise` of a different dtype silently changed
 the return dtype; a bool `t` became mask indexing; `p_losses` returned nan on an
 empty batch and accepted any broadcast-compatible model output, scoring a
-plausible ~1.0 for a model returning a scalar. The range check now does one
-device sync instead of two — the pair cost 10.6x on MPS for small tensors.
+plausible ~1.0 for a model returning a scalar. The range check now uses
+`aminmax` rather than separate `min` and `max` calls.
 
 Two documentation corrections. The `_derived` docstring said the float64
 ordering rescues the cosine schedule in float16 and quoted 1.5e-05; the real
@@ -138,6 +138,38 @@ all landing within its tolerance. N(0,I) is the worst possible probe, since the
 paper says `beta_t` is optimal for exactly that distribution and this code uses
 `beta-tilde`. I had repeated that claim in the README. Replaced with a
 point-mass oracle, which the wrong coefficients miss by orders of magnitude.
+
+Corrections to the entry above, from a fact-check of it. Three numbers in it
+were wrong, all of them overstating how much margin something had — which, in a
+round whose whole thesis was that a green suite is not the evidence it looks
+like, is the specific way I should least like to be wrong.
+
+- "the pair cost 10.6x on MPS" was not a measurement of this change. 10.6x is
+  the cost of the range check versus no range check at all. Two `min`/`max`
+  calls versus `aminmax` measures 1.03x to 1.18x. And "one device sync instead
+  of two" is wrong on its own terms: `aminmax` returns two tensors and `int()`
+  is called on each, so it removes a reduction kernel, not a transfer. Kept the
+  `aminmax` form because it is marginally faster and no less clear, but it buys
+  almost nothing.
+- "the two routes then agree to 1e-06 and the carve-out stands out by four
+  orders of magnitude" — in float32 they agree to 6.7e-05 and the carve-out
+  gives 2.4e-02, a ratio of 350x, not 10,000x. Worse, against the 1e-04
+  tolerance correct code cleared by only 1.15x. That is the same razor margin
+  that let the poisoned cache hide a real bug, described two paragraphs up, and
+  I wrote it down as though it were comfortable. Fixed properly rather than
+  re-worded: the cross-check now runs in **float64**, which the `parameter.dtype`
+  fix made possible. Noise floor 5.8e-13 against a 1e-9 tolerance, subtlest real
+  bug 1.5e-04 — 1700x of headroom below, 150,000x of signal above.
+- "beta[0] by 2.5e-04 relative" — 2.515e-04 is the maximum over the array, at
+  index 6. `beta[0]` moves by 1.660e-04. The 993-of-1000 count is right.
+
+Also overstated: the point-mass oracle does not miss wrong coefficients "by
+orders of magnitude rather than percent" in general. Of eight off-by-one
+mutants it catches three. At `t = 0` the coefficient `beta_0 / (1 - abar_0)` is
+exactly 1, so the last step projects onto the point regardless of what happened
+upstream — four mutants return mean exactly 0.5 and std exactly 0. It is a
+final-step and contraction test. The unfolded cross-check is what guards the
+recursion, catching all four of those at 2.2e-02 to 4.3e-02.
 
 The highest-value single edit in the round was one line: the `t` in the
 `p_losses` pin was a constant vector, `full((B,), 300)`. Making it varied killed

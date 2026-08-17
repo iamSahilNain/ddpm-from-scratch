@@ -40,7 +40,7 @@ its exact contract (shapes, dtypes, indexing, and what the maths has to mean):
 2. `q_sample(x0, t, noise)` — the closed-form forward marginal: jump from a
    clean image to any timestep in one shot.
 3. `p_losses(model, x0, t)` — the simplified noise-prediction training
-   objective. Four lines on top of `q_sample`.
+   objective. Four lines of maths on top of `q_sample`, plus input validation.
 4. `p_sample_loop(model, shape)` — ancestral sampling, noise to image.
 
 The reverse step uses the **exact forward posterior variance**,
@@ -80,8 +80,8 @@ are the optional `quadratic` and `sigmoid` schedules, which correctly raise
 `ValueError`.
 
 Skip the slow tests (full thousand-step sampling chains and an optimisation
-loop — two whole files plus one test in `test_derived.py`, about two minutes
-together):
+loop — two whole files plus two tests in `test_derived.py`; 17 slow tests,
+about two minutes, against 5 seconds for the rest):
 
 ```bash
 pytest -m "not slow"
@@ -102,8 +102,9 @@ What the suite checks, beyond shapes and finiteness:
   schedule while everything else runs on linear all pass all thirteen tests.
   The behavioural suite specifies the process; it does not pin the function.
 - **`test_derived.py`** — which is what pins it, now that the functions exist.
-  Recomputes the closed forms in float64, asserts `q_sample` and `p_losses`
-  read the same schedule `make_beta_schedule` produces, cross-checks the folded
+  Recomputes the closed forms in float64, asserts `q_sample` reads the same
+  schedule `make_beta_schedule` produces (`p_losses` inherits that through
+  `q_sample` rather than being pinned directly), cross-checks the folded
   reverse step against Ho et al. eq. 7 written out the long way, and covers the
   cache and the input contracts. All three mutants above die here. Kept in a
   separate file so the behavioural suites stay specifications rather than
@@ -115,15 +116,21 @@ What the suite checks, beyond shapes and finiteness:
   `model(x_t, zeros)` and the embedding still receives gradient, so the whole
   file stays green — only `test_derived.py` notices.
 - **`test_derived.py`** (again, for the reverse process) — this is where the
-  recursion is actually guarded. Two independent checks: the unfolded
-  recomputation, and a **point-mass oracle** whose optimal denoiser is analytic
-  and whose reverse chain must contract unit variance down to nothing and land
-  on the point. That second one exists because the Gaussian oracle above is
-  blind to whole classes of coefficient error, whereas a point mass misses them
-  by orders of magnitude. Mutants caught by nothing else in the suite: the
-  missing carve-out, the loop running forwards, the loop skipping its final
-  step, dropped timestep conditioning, timesteps permuted across the batch, and
-  three ways of clamping the schedule so part of it is never trained.
+  recursion is actually guarded, and the work is done by the **unfolded
+  recomputation**: the chain run a second time the long way, implied `x₀` then
+  the posterior mean as an explicit combination, so a folding error cannot be
+  duplicated into the reference. It runs in float64 deliberately. At float32
+  the two routes agree only to 6.7e-05 against a 1e-04 tolerance — a 1.15×
+  margin, which is a coin flip, not a test. In float64 they agree to 5.8e-13
+  against a 1e-9 tolerance, while the subtlest real bug measured lands at
+  1.5e-04. That is ~1700× of headroom below and ~150,000× of signal above.
+  A **point-mass oracle** sits alongside it, but do not overrate it: of eight
+  off-by-one mutants it catches three, because at `t = 0` the coefficient
+  `β₀/(1−ᾱ₀)` is exactly 1 and the last step projects onto the point whatever
+  happened earlier. It is a final-step and contraction check. Mutants caught by
+  nothing else in the suite: the missing carve-out, the loop running forwards,
+  the loop skipping its final step, dropped timestep conditioning, timesteps
+  permuted across the batch, and three ways of clamping the schedule.
 - **`test_sampling.py`** — structural checks, plus a closed-form oracle on
   standard Gaussian data, currently returning mean −0.017 and std 0.998
   against tolerances of 0.10 and 0.15. It is weaker than it looks and than an
@@ -185,7 +192,7 @@ data.py        MNIST at [-1, 1], plus a synthetic batch for tests
 train.py       training loop, EMA, AMP, checkpointing, CSV logging
 sample.py      generate from a checkpoint
 viz.py         image grids, forward-process strip, loss curve
-tests/         pytest suite; test_derived.py pins the forward process
+tests/         pytest suite; test_derived.py pins forward and reverse
 NOTES.md       build log
 ```
 

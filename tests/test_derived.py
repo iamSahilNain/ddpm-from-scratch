@@ -312,20 +312,30 @@ def test_the_reverse_step_matches_the_unfolded_posterior():
 
     Run against the oracle rather than an untrained UNet on purpose. An
     untrained network drifts into the hundreds over a thousand steps, and the
-    float32 rounding difference between the two algebraic routes drifts with it
-    — to about 1e-02, which would swallow the 1e-02 of spurious grain. The
-    oracle keeps the chain at unit scale, where the two routes agree to 1e-06
-    and the carve-out bug stands out by four orders of magnitude.
+    float32 rounding difference between the two algebraic routes drifts with
+    it — to about 1e-02, which would swallow the 1e-02 of spurious grain the
+    carve-out bug produces.
+
+    Run in **float64**, also on purpose, and this is what gives the test its
+    teeth. At float32 the two routes agree only to 6.7e-05 against a 1e-04
+    tolerance — correct code clears by 1.15x, which is not a margin, it is a
+    coin flip waiting for a slightly larger batch. In float64 they agree to
+    5.8e-13, so the tolerance below sits three orders above the noise floor
+    and five or more below the smallest real bug. ``p_sample_loop`` takes its
+    working dtype from the model's parameters, which is what makes this
+    possible.
     """
-    model = GaussianOracle().eval()
+    dtype = torch.float64
+    model = GaussianOracle().eval().to(dtype)
     shape = (2, 1, 8, 8)
-    schedule = _derived(dtype=torch.float32)
+    schedule = _derived(dtype=dtype)
 
     torch.manual_seed(31)
     actual = p_sample_loop(model, shape, device=torch.device("cpu"))
+    assert actual.dtype == dtype, "the chain did not adopt the model's dtype"
 
     torch.manual_seed(31)
-    x = torch.randn(shape)
+    x = torch.randn(shape, dtype=dtype)
     for step in reversed(range(DEFAULT_TIMESTEPS)):
         t = torch.full((shape[0],), step, dtype=torch.long)
         with torch.no_grad():
@@ -346,10 +356,10 @@ def test_the_reverse_step_matches_the_unfolded_posterior():
         else:
             x = mean
 
-    assert torch.allclose(actual, x, atol=1e-4), (
+    assert torch.allclose(actual, x, atol=1e-9), (
         f"max deviation {(actual - x).abs().max().item():.3e} between the folded "
-        "recursion and the unfolded posterior — the carve-out bug shows up here "
-        "at around 1e-02"
+        "recursion and the unfolded posterior; the float64 noise floor is 6e-13 "
+        "and the smallest real bug seen here is 1e-04"
     )
 
 
@@ -405,10 +415,21 @@ def test_sampling_collapses_onto_a_point_mass():
     catch any of the classic alpha-swap or off-by-one errors — every one of
     them lands within its tolerance.
 
-    A point mass is the opposite extreme. The reverse chain has to contract a
-    unit-variance start down to essentially zero variance over a thousand
-    steps and land exactly on the point, which the wrong coefficients miss by
-    orders of magnitude rather than by percent.
+    A point mass is the opposite extreme: the chain has to contract a
+    unit-variance start down to essentially nothing and land on the point.
+
+    Be precise about what this does and does not cover, because it is easy to
+    overrate. Measured against eight off-by-one mutants it catches three. It
+    misses ``betas[step-1]``, ``posterior_variance[step-1]``,
+    ``alphas[step-1]`` and ``sqrt_1mab[step-1]``, all of which still return
+    mean exactly 0.5 and std exactly 0. The reason is structural: at ``t = 0``
+    the coefficient ``beta_0 / (1 - alpha_bar_0)`` is exactly 1, so the last
+    step projects onto the point regardless of what happened upstream. This is
+    a *final-step and contraction* test, not a whole-recursion test.
+
+    The recursion itself is guarded by
+    :func:`test_the_reverse_step_matches_the_unfolded_posterior`, which catches
+    all four of those at deviations from 2.2e-02 to 4.3e-02.
     """
     torch.manual_seed(17)
     out = p_sample_loop(_PointMassOracle(0.5).eval(), (16, 1, 8, 8), device=torch.device("cpu"))
