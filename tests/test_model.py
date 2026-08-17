@@ -1,11 +1,12 @@
 """Tests for the scaffolding: the UNet and the timestep embedding.
 
-Not part of the learning checkpoint. These exist so that a red test run points
-at the diffusion code rather than leaving open the question of whether the
-network underneath it is sound.
+These exist so that a red test run points at the diffusion code rather than
+leaving open the question of whether the network underneath it is sound.
 """
 
 from __future__ import annotations
+
+import math
 
 import pytest
 import torch
@@ -123,3 +124,87 @@ def test_gradients_flow_through_the_whole_network():
 def test_default_model_is_small_enough_to_train_locally():
     model = UNet()
     assert count_parameters(model) < 20_000_000
+
+
+# --------------------------------------------------------------------------- #
+# Attention. Added after a review found this block had no coverage at all:
+# deleting its residual, dropping the output permute, and setting k = q or
+# v = q all left the entire suite green.
+# --------------------------------------------------------------------------- #
+
+
+def test_attention_matches_an_independent_reference():
+    """Recompute the block with einsum rather than reshape-and-permute.
+
+    The six lines of index gymnastics in AttentionBlock.forward are the most
+    error-prone in the file, and a wrong permute scrambles head, channel and
+    spatial layout in a way that still returns the right shape and still
+    trains to a plausible loss.
+    """
+    from model import AttentionBlock
+
+    torch.manual_seed(0)
+    block = AttentionBlock(channels=16).eval()
+    x = torch.randn(2, 16, 5, 5)
+
+    with torch.no_grad():
+        actual = block(x)
+
+        b, c, h, w = x.shape
+        heads, head_dim = block.num_heads, 16 // block.num_heads
+        qkv = block.qkv(block.norm(x))
+        q, k, v = (
+            part.reshape(b, heads, head_dim, h * w) for part in qkv.chunk(3, dim=1)
+        )
+        weights = torch.softmax(
+            torch.einsum("bhdi,bhdj->bhij", q, k) / math.sqrt(head_dim), dim=-1
+        )
+        attended = torch.einsum("bhij,bhdj->bhdi", weights, v).reshape(b, c, h, w)
+        expected = x + block.proj(attended)
+
+    assert torch.allclose(actual, expected, atol=1e-5), (
+        f"max deviation {(actual - expected).abs().max().item():.3e} from the "
+        "einsum reference"
+    )
+
+
+def test_attention_is_equivariant_to_permuting_positions():
+    """Attention is set-based: permute the pixels, permute the output.
+
+    Catches a transposed or mis-ordered spatial axis, which no shape check can
+    see because H and W are usually equal.
+    """
+    from model import AttentionBlock
+
+    torch.manual_seed(1)
+    block = AttentionBlock(channels=8).eval()
+    x = torch.randn(1, 8, 4, 4)
+    order = torch.randperm(16)
+
+    with torch.no_grad():
+        straight = block(x).flatten(2)[..., order]
+        permuted = block(x.flatten(2)[..., order].reshape(1, 8, 4, 4)).flatten(2)
+
+    assert torch.allclose(straight, permuted, atol=1e-5)
+
+
+def test_attention_actually_mixes_distant_positions():
+    """The point of the block: one corner must be able to affect another.
+
+    A block that returned its input, or attended only to itself, would pass
+    every shape and finiteness check in this file.
+    """
+    from model import AttentionBlock
+
+    torch.manual_seed(2)
+    block = AttentionBlock(channels=8).eval()
+    x = torch.randn(1, 8, 6, 6)
+    poked = x.clone()
+    poked[0, :, 0, 0] += 5.0
+
+    with torch.no_grad():
+        delta = (block(poked) - block(x)).abs()
+
+    assert delta[0, :, 3, 3].max().item() > 1e-3, (
+        "poking one corner left a distant position untouched — no mixing"
+    )

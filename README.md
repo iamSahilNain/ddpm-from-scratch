@@ -164,6 +164,20 @@ python train.py --epochs 20 --batch-size 128
 Writes to `runs/mnist/`: `checkpoints/` (rolling `last.pt` plus one per epoch),
 `logs/loss.csv`, `samples/`, and the resolved `config.json`.
 
+Budget for it before you start. At the default width the model is 7.28M
+parameters and one step takes about 1.6 s on an M-series GPU, so an MNIST epoch
+of 468 steps is roughly 12 minutes and the 20-epoch command above is about
+**4 hours** — call it 14 on CPU. Each checkpoint is **117 MB** (weights, the
+float32 EMA shadow, and two AdamW moments) and one is kept per epoch with no
+pruning, so a full run leaves **2.5 GB** behind. `--base-channels 32` cuts the
+model to 1.83M parameters and is the setting to start with.
+
+`--epochs` is an absolute target, not a number of additional epochs: resuming a
+checkpoint at epoch 20 with `--epochs 20` is refused rather than silently doing
+nothing. `--lr` and `--ema-decay` are also refused on resume, since the
+optimiser and EMA restore their own state. The RNG state travels in the
+checkpoint, so a resumed run continues the noise stream instead of replaying it.
+
 ```bash
 python train.py --resume runs/mnist/checkpoints/last.pt
 python train.py --base-channels 32 --device cpu --no-amp   # smaller/slower box

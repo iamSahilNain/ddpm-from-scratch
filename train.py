@@ -1,7 +1,7 @@
 """Training loop for the DDPM: mixed precision, checkpointing, CSV loss log.
 
-Nothing here is part of the learning checkpoint. It will not run until
-:func:`diffusion.p_losses` exists, because that is the only thing it optimises.
+The objective it optimises is :func:`diffusion.p_losses`, and the sample
+sheets it writes go through :func:`diffusion.p_sample_loop`.
 
 Usage:
     python train.py --epochs 20 --batch-size 128
@@ -71,9 +71,10 @@ def amp_settings(device: torch.device, requested: bool) -> tuple[bool, torch.dty
     """Decide whether to actually use autocast, and in which dtype.
 
     Mixed precision is only a clear win on CUDA, where the gradient scaler and
-    fp16 tensor cores both exist. MPS autocast is available but the speedup on
+    fp16 tensor cores both exist. MPS autocast is available, but the speedup on
     a model this small is noise and the numerics are less well trodden, so it
-    stays off unless asked for explicitly; on CPU it is off outright.
+    is off there unconditionally — there is no flag to force it on — and off on
+    CPU too. Only ``--no-amp`` exists, and only CUDA is affected by it.
     """
     if not requested or device.type == "cpu":
         return False, torch.float32
@@ -178,7 +179,7 @@ def build_model(config: TrainConfig) -> UNet:
 
 
 def train(config: TrainConfig) -> str:
-    from diffusion import DEFAULT_TIMESTEPS, p_losses  # late so --help works pre-checkpoint 3
+    from diffusion import DEFAULT_TIMESTEPS, p_losses  # late so --help stays fast
 
     # The schedule length is global to the process (see diffusion.py's module
     # docstring): q_sample and p_sample_loop always use DEFAULT_TIMESTEPS. A
@@ -199,9 +200,13 @@ def train(config: TrainConfig) -> str:
     checkpoint_dir = os.path.join(config.out_dir, "checkpoints")
     sample_dir = os.path.join(config.out_dir, "samples")
     log_path = os.path.join(config.out_dir, "logs", "loss.csv")
+    resume_path = getattr(config, "_resume", None)
+    if resume_path and not os.path.exists(resume_path):
+        # Checked before the dataloader, which on a real MNIST setup can take
+        # long enough that a typo'd path is an expensive way to learn to type.
+        raise FileNotFoundError(f"--resume {resume_path} does not exist")
+
     os.makedirs(config.out_dir, exist_ok=True)
-    with open(os.path.join(config.out_dir, "config.json"), "w") as handle:
-        json.dump(asdict(config), handle, indent=2, default=str)
 
     loader = get_mnist_dataloader(
         batch_size=config.batch_size,
@@ -220,10 +225,37 @@ def train(config: TrainConfig) -> str:
     logger = CSVLogger(log_path)
 
     start_epoch, global_step = 0, 0
-    if getattr(config, "_resume", None):
+    if resume_path:
         start_epoch, global_step = load_for_resume(
-            config._resume, model, ema, optimizer, scaler, device
+            resume_path, model, ema, optimizer, scaler, device
         )
+        # --epochs is an absolute target, not "this many more". Without this
+        # check, resuming a finished run prints the banners, trains nothing and
+        # exits zero, which is indistinguishable from success.
+        if start_epoch >= config.epochs:
+            raise ValueError(
+                f"checkpoint is already at epoch {start_epoch} and --epochs is "
+                f"{config.epochs}, so there is nothing to do. --epochs is an "
+                f"absolute target: pass --epochs {start_epoch + 10} to train ten more."
+            )
+        # The optimizer and EMA restore their checkpointed hyperparameters, so
+        # these flags would be silently ignored while being recorded as though
+        # they had applied.
+        defaults = TrainConfig()
+        for flag, value, restored in (
+            ("--lr", config.lr, optimizer.param_groups[0]["lr"]),
+            ("--ema-decay", config.ema_decay, ema.decay),
+        ):
+            if value != restored and value != getattr(defaults, flag[2:].replace("-", "_")):
+                raise ValueError(
+                    f"{flag}={value} cannot be applied on resume; the checkpoint "
+                    f"restores {restored}. Omit it, or start a fresh run."
+                )
+
+    # Written only once everything that can fail has succeeded, so a config.json
+    # on disk always describes a run that actually started.
+    with open(os.path.join(config.out_dir, "config.json"), "w") as handle:
+        json.dump(asdict(config), handle, indent=2, default=str)
 
     print(f"device={device}  amp={use_amp}({amp_dtype})  params={count_parameters(model):,}")
     print(f"batches/epoch={len(loader)}  out_dir={config.out_dir}")
@@ -274,6 +306,11 @@ def train(config: TrainConfig) -> str:
             "epoch": epoch + 1,
             "global_step": global_step,
             "config": asdict(config),
+            # Without this a resumed run reseeds from config.seed and replays
+            # the exact timestep and noise draws it already trained on. A run
+            # resumed once per epoch would see the same few hundred timestep
+            # vectors for ever, with a completely normal-looking loss curve.
+            "rng_state": torch.get_rng_state(),
         }
         save_checkpoint(os.path.join(checkpoint_dir, "last.pt"), **state)
         save_checkpoint(os.path.join(checkpoint_dir, f"epoch_{epoch:04d}.pt"), **state)
@@ -312,6 +349,12 @@ def load_for_resume(path, model, ema, optimizer, scaler, device) -> tuple[int, i
     ema.load_state_dict(state["ema"])
     optimizer.load_state_dict(state["optimizer"])
     scaler.load_state_dict(state["scaler"])
+    if "rng_state" in state:
+        # Continue the random stream rather than restarting it. Checkpoints
+        # written before this was saved simply carry on reseeded.
+        torch.set_rng_state(state["rng_state"].to(torch.uint8).cpu())
+    else:
+        print("  (checkpoint predates RNG-state saving; the noise stream restarts)")
     print(f"resumed from {path} at epoch {state['epoch']}, step {state['global_step']}")
     return state["epoch"], state["global_step"]
 

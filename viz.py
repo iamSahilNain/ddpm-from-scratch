@@ -1,9 +1,9 @@
 """Plotting helpers: image grids, forward-process strips, sample sheets.
 
-Two of these call into :mod:`diffusion` and will therefore raise
-``NotImplementedError`` until the checkpoint functions exist. That is expected;
-:func:`make_grid` and :func:`save_image_grid` work standalone and are useful for
-eyeballing the dataloader before any of the diffusion code is written.
+Two of these call into :mod:`diffusion`, so they depend on the forward and
+reverse processes being implemented; both are. :func:`make_grid` and
+:func:`save_image_grid` work standalone and are useful for eyeballing the
+dataloader on its own.
 """
 
 from __future__ import annotations

@@ -113,9 +113,12 @@ class GaussianOracle(nn.Module):
     graded on the distribution where the two branches agree most closely and
     the residual is least diagnostic.
 
-    ``tests/test_derived.py`` carries the checks with real teeth: an unfolded
-    recomputation of the recursion, and a point-mass oracle whose contraction
-    the wrong coefficients miss by orders of magnitude rather than percent.
+    ``tests/test_derived.py`` carries the check with real teeth: an unfolded
+    recomputation of the recursion, run in float64, where correct code sits
+    5.8e-13 from the reference and the subtlest real bug sits 1.5e-04 away. A
+    point-mass oracle sits beside it, but catches only three of eight
+    off-by-one mutants — at ``t = 0`` the last step projects onto the point
+    whatever went wrong earlier, so it tests contraction, not the recursion.
     """
 
     def __init__(self, timesteps: int = DEFAULT_TIMESTEPS):
@@ -137,9 +140,12 @@ def test_reverse_process_inverts_the_forward_process():
     """With the optimal denoiser, sampling must return standard Gaussians.
 
     Both of the fixed variance choices Ho et al. describe satisfy this, so the
-    test does not force a preference between them. Nothing else does: the
-    tolerances here are a few percent, and a recursion that is wrong in any of
-    the usual ways overshoots them by a factor of a hundred or more.
+    test does not force a preference between them.
+
+    Do not read more into a pass than is there. Measured, this catches a sign
+    error and a badly mis-scaled variance, and nothing else: seven
+    swapped-alpha and off-by-one mutants all land between std 0.9835 and
+    1.0052, inside the tolerances below. See the class docstring for why.
     """
     torch.manual_seed(4)
     oracle = GaussianOracle().eval()
